@@ -20,7 +20,7 @@ except ImportError:
     # If not tqdm is not available, provide a mock version of it
     def tqdm(x): return x
 
-from models.inception import InceptionV3
+from .inception import InceptionV3
 
 
 class ImagePathDataset(torch.utils.data.Dataset):
@@ -112,7 +112,7 @@ def _compute_activations(path, model, batch_size, dims, device):
     return act
 
 
-def calculate_kid_given_paths(paths, batch_size, device, dims):
+def calculate_kid_given_paths(paths, batch_size, device, dims, use_fid_inception=False):
     """Calculates the KID of two paths"""
     pths = []
     for p in paths:
@@ -126,7 +126,7 @@ def calculate_kid_given_paths(paths, batch_size, device, dims):
             pths.append(np_imgs)
 
     block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
-    model = InceptionV3([block_idx]).to(device)
+    model = InceptionV3([block_idx], use_fid_inception=use_fid_inception).to(device)
 
     act_true = _compute_activations(pths[0], model, batch_size, dims, device=device)
     pths = pths[1:]
@@ -279,10 +279,13 @@ if __name__ == '__main__':
                               'By default, uses pool3 features'))
     parser.add_argument('--device', default='cpu', type=str,
                         help='gpu (cuda) or cpu')
+    parser.add_argument('--use_fid_inception', action='store_true', required=False, 
+                        help=('uses the pretrained Inception model used in Tensorflow\'s FID implementation'))
     args = parser.parse_args()
     print(args)
     paths = [args.true] + args.fake
 
-    results = calculate_kid_given_paths(paths, args.batch_size, device=args.device, dims=args.dims)
+    results = calculate_kid_given_paths(paths, args.batch_size, device=args.device, dims=args.dims,
+                                        use_fid_inception=args.use_fid_inception)
     for p, m, s in results:
-        print('KID (%s): %.3f (%.3f)' % (p, m, s))
+        print('KID (%s): %.5f (%.5f)' % (p, m, s))

@@ -50,7 +50,7 @@ try:
 except ImportError:
     # If not tqdm is not available, provide a mock version of it
     def tqdm(x): return x
-from models.inception import InceptionV3
+from .inception import InceptionV3
 
 
 class ImagePathDataset(torch.utils.data.Dataset):
@@ -261,7 +261,7 @@ def _compute_activations(path, model, batch_size, dims, device):
     return get_activations(path, model, batch_size, dims, device=device)
 
 
-def calculate_fid_given_paths(paths, batch_size, device, dims, torch_svd = False):
+def calculate_fid_given_paths(paths, batch_size, device, dims, torch_svd = False, use_fid_inception=False):
     """Calculates the FID of two paths"""
     pths = []
     for p in paths:
@@ -276,7 +276,7 @@ def calculate_fid_given_paths(paths, batch_size, device, dims, torch_svd = False
             pths.append(np_imgs)
 
     block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
-    model = InceptionV3([block_idx]).to(device)
+    model = InceptionV3([block_idx], use_fid_inception=use_fid_inception).to(device)
 
     act_true = _compute_activations(pths[0], model, batch_size, dims, device=device)
     pths = pths[1:]
@@ -297,7 +297,7 @@ def calculate_fid_given_paths(paths, batch_size, device, dims, torch_svd = False
 if __name__ == '__main__':
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument('--torch_svd', action='store_true', required=False, 
-                        help=('compute frechet distance with pytorch (quicker, but final result is different with original method)'))
+                        help=('compute frechet distance with pytorch (quicker, but final result is different with original method'))
     parser.add_argument('--true', type=str, required=True,
                         help=('Path to the true images'))
     parser.add_argument('--fake', type=str, nargs='+', required=True,
@@ -308,12 +308,15 @@ if __name__ == '__main__':
                         choices=list(InceptionV3.BLOCK_INDEX_BY_DIM),
                         help=('Dimensionality of Inception features to use. '
                               'By default, uses pool3 features'))
+    parser.add_argument('--use_fid_inception', action='store_true', required=False, 
+                        help=('uses the pretrained Inception model used in Tensorflow\'s FID implementation'))
     parser.add_argument('--device', default='cpu', type=str,
                         help='gpu (cuda) or cpu')
     args = parser.parse_args()
     print(args)
     paths = [args.true] + args.fake
 
-    results = calculate_fid_given_paths(paths, args.batch_size, device=args.device, dims=args.dims, torch_svd=args.torch_svd)
+    results = calculate_fid_given_paths(paths, args.batch_size, device=args.device, dims=args.dims,
+                                        torch_svd=args.torch_svd, use_fid_inception=args.use_fid_inception)
     for p, m in results:
         print('FID (%s): %.2f' % (p, m))

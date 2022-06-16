@@ -38,22 +38,39 @@ from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 
 import numpy as np
 import torch
+import math
 from scipy import linalg
 from PIL import Image
 from torch.nn.functional import adaptive_avg_pool2d
+import torchvision.transforms as TF
+
 
 try:
     from tqdm import tqdm
 except ImportError:
     # If not tqdm is not available, provide a mock version of it
     def tqdm(x): return x
-#from models import lenet
 from models.inception import InceptionV3
-from models.lenet import LeNet5
 
 
-def get_activations(files, model, batch_size=50, dims=2048,
-                    cuda=False, verbose=False):
+class ImagePathDataset(torch.utils.data.Dataset):
+    def __init__(self, files, transforms=None):
+        self.files = files
+        self.transforms = transforms
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, i):
+        path = self.files[i]
+        img = Image.open(path).convert('RGB')
+        if self.transforms is not None:
+            img = self.transforms(img)
+        return img
+
+
+def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
+                    num_workers=1):
     """Calculates the activations of the pool_3 layer for all images.
 
     Params:
@@ -65,9 +82,9 @@ def get_activations(files, model, batch_size=50, dims=2048,
                      behavior is retained to match the original FID score
                      implementation.
     -- dims        : Dimensionality of features returned by Inception
-    -- cuda        : If set to True, use GPU
-    -- verbose     : If set to True and parameter out_step is given, the number
-                     of calculated batches is reported.
+    -- device      : Device to run calculations
+    -- num_workers : Number of parallel dataloader workers
+
     Returns:
     -- A numpy array of dimension (num images, dims) that contains the
        activations of the given tensor when feeding inception with the
@@ -75,52 +92,42 @@ def get_activations(files, model, batch_size=50, dims=2048,
     """
     model.eval()
 
-    is_numpy = True if type(files[0]) == np.ndarray else False
-
-    if len(files) % batch_size != 0:
-        print(('Warning: number of images is not a multiple of the '
-               'batch size. Some samples are going to be ignored.'))
     if batch_size > len(files):
         print(('Warning: batch size is bigger than the data size. '
                'Setting batch size to data size'))
         batch_size = len(files)
 
-    n_batches = len(files) // batch_size
-    n_used_imgs = n_batches * batch_size
+    dataset = ImagePathDataset(files, transforms=TF.ToTensor())
+    dataloader = torch.utils.data.DataLoader(dataset,
+                                             batch_size=batch_size,
+                                             shuffle=False,
+                                             drop_last=False,
+                                             num_workers=num_workers)
 
-    pred_arr = np.empty((n_used_imgs, dims))
+    pred_arr = np.empty((len(files), dims))
 
-    for i in tqdm(range(n_batches)):
-        if verbose:
-            print('\rPropagating batch %d/%d' % (i + 1, n_batches), end='', flush=True)
-        start = i * batch_size
-        end = start + batch_size
-        if is_numpy:
-            images = np.copy(files[start:end]) + 1
-            images /= 2.
-        else:
-            images = [np.array(Image.open(str(f))) for f in files[start:end]]
-            images = np.stack(images).astype(np.float32) / 255.
-            # Reshape to (n_images, 3, height, width)
-            images = images.transpose((0, 3, 1, 2))
+    start_idx = 0
 
-        batch = torch.from_numpy(images).type(torch.FloatTensor)
-        if cuda:
-            batch = batch.cuda()
+    for batch in tqdm(dataloader):
+        batch = batch.to(device)
 
-        pred = model(batch)[0]
+        with torch.no_grad():
+            pred = model(batch)[0]
 
         # If model output is not scalar, apply global spatial average pooling.
         # This happens if you choose a dimensionality not equal 2048.
-        if pred.shape[2] != 1 or pred.shape[3] != 1:
+        if pred.size(2) != 1 or pred.size(3) != 1:
             pred = adaptive_avg_pool2d(pred, output_size=(1, 1))
 
-        pred_arr[start:end] = pred.cpu().data.numpy().reshape(batch_size, -1)
+        pred = pred.squeeze(3).squeeze(2).cpu().numpy()
 
-    if verbose:
-        print('done', np.min(images))
+        pred_arr[start_idx:start_idx + pred.shape[0]] = pred
+
+        start_idx = start_idx + pred.shape[0]
 
     return pred_arr
+
+
 
 
 def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
@@ -179,6 +186,43 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     return (diff.dot(diff) + np.trace(sigma1) +
             np.trace(sigma2) - 2 * tr_covmean)
 
+# https://github.com/pytorch/pytorch/issues/25481#issuecomment-576493693
+def symsqrt(matrix):
+    """Compute the square root of a positive definite matrix."""
+    _, s, v = matrix.svd()
+    good = s > s.max(-1, True).values * s.size(-1) * torch.finfo(s.dtype).eps
+    components = good.sum(-1)
+    common = components.max()
+    unbalanced = common != components.min()
+    if common < s.size(-1):
+        s = s[..., :common]
+        v = v[..., :common]
+        if unbalanced:
+            good = good[..., :common]
+    if unbalanced:
+        s = s.where(good, torch.zeros((), device=s.device, dtype=s.dtype))
+    return (v * s.sqrt().unsqueeze(-2)) @ v.transpose(-2, -1)
+
+
+def calculate_frechet_distance_torch(mu1, sigma1, mu2, sigma2, device, eps=1e-6):
+    mu1 = torch.Tensor(mu1).to(device)
+    mu2 = torch.Tensor(mu2).to(device)
+    sigma1 = torch.Tensor(sigma1).to(device)
+    sigma2 = torch.Tensor(sigma2).to(device)
+
+    assert mu1.shape == mu2.shape, \
+        'Training and test mean vectors have different lengths'
+    assert sigma1.shape == sigma2.shape, \
+        'Training and test covariances have different dimensions'
+
+    diff = mu1 - mu2
+
+    covmean = symsqrt(sigma1 @ sigma2)
+    tr_covmean = torch.trace(covmean)
+
+    distance = (diff * diff).sum() + torch.trace(sigma1) + torch.trace(sigma2) - 2 * tr_covmean
+    return distance.item()
+
 
 def calculate_activation_statistics(act):
     """Calculation of the statistics used by the FID.
@@ -203,24 +247,7 @@ def calculate_activation_statistics(act):
     return mu, sigma
 
 
-def extract_lenet_features(imgs, net, cuda):
-    net.eval()
-    feats = []
-    imgs = imgs.reshape([-1, 100] + list(imgs.shape[1:]))
-    if imgs[0].min() < -0.001:
-      imgs = (imgs + 1)/2.0
-    print(imgs.shape, imgs.min(), imgs.max())
-    if cuda:
-        imgs = torch.from_numpy(imgs).cuda()
-    else:
-        imgs = torch.from_numpy(imgs)
-    for i, images in enumerate(imgs):
-        feats.append(net.extract_features(images).detach().cpu().numpy())
-    feats = np.vstack(feats)
-    return feats
-
-
-def _compute_activations(path, model, batch_size, dims, cuda, model_type):
+def _compute_activations(path, model, batch_size, dims, device):
     if not type(path) == np.ndarray:
         import glob
         jpg = os.path.join(path, '*.jpg')
@@ -230,15 +257,11 @@ def _compute_activations(path, model, batch_size, dims, cuda, model_type):
             import random
             random.shuffle(path)
             path = path[:25000]
-    if model_type == 'inception':
-        act = get_activations(path, model, batch_size, dims, cuda)
-    elif model_type == 'lenet':
-        act = extract_lenet_features(path, model, cuda)
 
-    return act
+    return get_activations(path, model, batch_size, dims, device=device)
 
 
-def calculate_fid_given_paths(paths, batch_size, cuda, dims, bootstrap=True, n_bootstraps=10, model_type='inception'):
+def calculate_fid_given_paths(paths, batch_size, device, dims, torch_svd = False):
     """Calculates the FID of two paths"""
     pths = []
     for p in paths:
@@ -253,37 +276,28 @@ def calculate_fid_given_paths(paths, batch_size, cuda, dims, bootstrap=True, n_b
             pths.append(np_imgs)
 
     block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
+    model = InceptionV3([block_idx]).to(device)
 
-    if model_type == 'inception':
-        model = InceptionV3([block_idx])
-    elif model_type == 'lenet':
-        model = LeNet5()
-        model.load_state_dict(torch.load('./models/lenet.pth'))
-    if cuda:
-       model.cuda()
-
-    act_true = _compute_activations(pths[0], model, batch_size, dims, cuda, model_type)
-    n_bootstraps = n_bootstraps if bootstrap else 1
+    act_true = _compute_activations(pths[0], model, batch_size, dims, device=device)
     pths = pths[1:]
     results = []
     for j, pth in enumerate(pths):
         print(paths[j+1])
-        actj = _compute_activations(pth, model, batch_size, dims, cuda, model_type)
-        fid_values = np.zeros((n_bootstraps))
-        with tqdm(range(n_bootstraps), desc='FID') as bar:
-            for i in bar:
-                act1_bs = act_true[np.random.choice(act_true.shape[0], act_true.shape[0], replace=True)]
-                act2_bs = actj[np.random.choice(actj.shape[0], actj.shape[0], replace=True)]
-                m1, s1 = calculate_activation_statistics(act1_bs)
-                m2, s2 = calculate_activation_statistics(act2_bs)
-                fid_values[i] = calculate_frechet_distance(m1, s1, m2, s2)
-                bar.set_postfix({'mean': fid_values[:i+1].mean()})
-        results.append((paths[j+1], fid_values.mean(), fid_values.std()))
+        actj = _compute_activations(pth, model, batch_size, dims, device=device)
+        m1, s1 = calculate_activation_statistics(act_true)
+        m2, s2 = calculate_activation_statistics(actj)
+        if torch_svd:
+            fid_value = calculate_frechet_distance_torch(m1, s1, m2, s2, device=device)
+        else:
+            fid_value = calculate_frechet_distance(m1, s1, m2, s2)
+        results.append((paths[j+1], fid_value))
     return results
 
 
 if __name__ == '__main__':
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--torch_svd', action='store_true', required=False, 
+                        help=('compute frechet distance with pytorch (quicker, but final result is different with original method)'))
     parser.add_argument('--true', type=str, required=True,
                         help=('Path to the true images'))
     parser.add_argument('--fake', type=str, nargs='+', required=True,
@@ -294,15 +308,12 @@ if __name__ == '__main__':
                         choices=list(InceptionV3.BLOCK_INDEX_BY_DIM),
                         help=('Dimensionality of Inception features to use. '
                               'By default, uses pool3 features'))
-    parser.add_argument('-c', '--gpu', default='', type=str,
-                        help='GPU to use (leave blank for CPU only)')
-    parser.add_argument('--model', default='inception', type=str,
-                        help='inception or lenet')
+    parser.add_argument('--device', default='cpu', type=str,
+                        help='gpu (cuda) or cpu')
     args = parser.parse_args()
     print(args)
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     paths = [args.true] + args.fake
 
-    results = calculate_fid_given_paths(paths, args.batch_size, args.gpu != '', args.dims, model_type=args.model)
-    for p, m, s in results:
-        print('FID (%s): %.2f (%.3f)' % (p, m, s))
+    results = calculate_fid_given_paths(paths, args.batch_size, device=args.device, dims=args.dims, torch_svd=args.torch_svd)
+    for p, m in results:
+        print('FID (%s): %.2f' % (p, m))
